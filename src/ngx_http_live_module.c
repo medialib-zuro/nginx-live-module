@@ -8,30 +8,36 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 #include <ngx_md5.h>
+#include "ngx_ts_hls.h"
+#include "ngx_http_live_module.h"
 
+#define GOP_COUNT_LIMIT         8
 
 typedef struct {
-    ngx_rbtree_t                rbtree;
+    ngx_atomic_t                n_active;
+    ngx_rbtree_t                ptree;
     ngx_rbtree_node_t           sentinel;
 } ngx_http_live_sh_t;
 
 
 typedef struct {
-    ngx_rbtree_t                rbtree;
+    ngx_rbtree_t                btree;
+    ngx_rbtree_node_t           bsentinel;
+    ngx_rbtree_t                gtree;
     ngx_rbtree_node_t           sentinel;
     ngx_http_live_sh_t         *sh;
     ngx_slab_pool_t            *shpool;
+    ngx_uint_t                  max_conns;
     unsigned                    persistent:1;
-    unsigned                    consistent:1;
     unsigned                    flush:1;
 } ngx_http_live_t;
 
 
 typedef struct {
     ngx_rbtree_node_t           node;
+    ngx_pid_t                   pid;
     u_char                      md5[16];
-} ngx_http_live_node_t;
-
+} ngx_http_live_post_node_t;
 
 typedef struct {
     ngx_rbtree_node_t           node;
@@ -39,12 +45,29 @@ typedef struct {
     ngx_http_request_t         *request;
 } ngx_http_live_get_node_t;
 
+typedef struct {
+    ngx_rbtree_node_t           node;
+    u_char                      md5[16];
+    ngx_uint_t                  size;
+    ngx_uint_t                  count;
+    ngx_pool_t                 *pool;
+    ngx_chain_t               **pbusy;
+    ngx_chain_t               **pfree;
+    ngx_chain_t                *busy;
+    ngx_chain_t                *free;
+    ngx_chain_t                *key;
+    ngx_uint_t                  latest_counter;
+    ngx_buf_t                  *ts_index_tables;
+} ngx_http_live_gop_node_t;
 
 typedef struct {
     size_t                      size;
+    size_t                      kpos;
     ngx_http_live_t            *live;
     ngx_uint_t                  counter;
-    ngx_uint_t                  last;  /* unsigned  last:1; */
+    ngx_uint_t                  flag;
+    unsigned                    last;
+    unsigned                    expired:1;
     u_char                      md5[16];
     u_char                      data[1];
 } ngx_http_live_msg_t;
@@ -54,17 +77,21 @@ typedef struct {
     ngx_str_t                   key;
     u_char                      md5[16];
     ngx_buf_t                  *buf;
+    ngx_chain_t                *in;
     ngx_chain_t                *out;
     ngx_chain_t                *free;
     ngx_chain_t                *busy;
     ngx_http_live_t            *live;
-    ngx_http_live_node_t       *node;
+    ngx_http_live_post_node_t  *post;
     ngx_http_live_get_node_t   *get;
     ngx_http_request_t         *request;
-    ngx_uint_t                  counter;
+    ngx_uint_t                  size; // for GET, partial read size of a msg
+    ngx_uint_t                  counter; // for POST/GET, msg counter
     ngx_uint_t                  allocated;
-    unsigned                    last_sent:1;
     unsigned                    done:1;
+    ngx_ts_stream_t            *ts;
+    ngx_flag_t                  do_hls_live;
+    ngx_flag_t                  do_hls_playback;
 } ngx_http_live_ctx_t;
 
 
@@ -72,20 +99,27 @@ typedef struct {
     ngx_shm_zone_t             *shm_zone;
     ngx_uint_t                  methods;
     ngx_http_complex_value_t   *key;
-    ngx_bufs_t                  bufs;
+    ngx_ts_hls_conf_t          *live_hls;
+    ngx_ts_hls_conf_t          *playback_hls;
 } ngx_http_live_loc_conf_t;
 
-
 typedef struct {
+    size_t                      relay_buffer_size;
     size_t                      buffer_size;
+    size_t                      buffer_limit;
+    ngx_bufs_t                  bufs;
     ngx_socket_t               *write_fd;
     ngx_socket_t               *read_fd;
     ngx_uint_t                  nfd;
     ngx_buf_t                  *buf;
     ngx_connection_t          **conn;
-    ngx_uint_t                  enabled;  /* unsigned  enabled:1; */
+    ngx_http_live_t             *live;
+    ngx_msec_t                  check_period;
+    ngx_event_t                 check_event;
+    ngx_flag_t                  gop_cache;  /* enabled:1; */
+    ngx_flag_t                  live_hls_enabled;  /* enabled:1; */
+    ngx_flag_t                  enabled;  /* enabled:1; */
 } ngx_http_live_main_conf_t;
-
 
 static ngx_int_t ngx_http_live_handler(ngx_http_request_t *r);
 
@@ -94,25 +128,41 @@ static void ngx_http_live_get_cleanup(void *data);
 static ngx_http_live_get_node_t *ngx_http_live_get_rbtree_lookup(
     ngx_rbtree_t *rbtree, u_char *md5);
 static void ngx_http_live_get_rbtree_insert_value(ngx_rbtree_node_t *temp,
-    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+        ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
 static void ngx_http_live_get_write_handler(ngx_http_request_t *r);
-static void ngx_http_live_get_data_handler(ngx_http_request_t *r, u_char *p,
-    size_t size, ngx_uint_t counter, ngx_uint_t last);
+
+static ngx_http_live_gop_node_t *ngx_http_live_gop_node_alloc(ngx_pool_t *pool, ngx_log_t *log);
+static void ngx_http_live_gop_node_cleanup(ngx_pool_t *pool, ngx_http_live_gop_node_t *gop);
+static void ngx_http_live_gop_buf_handler(ngx_http_request_t *r,
+        ngx_http_live_gop_node_t *gop);
+
+static void ngx_http_live_gop_mark_expired(ngx_http_live_gop_node_t *gop, size_t limit);
+static void ngx_http_live_gop_free_expired(ngx_http_live_gop_node_t *gop);
+static ngx_int_t ngx_http_live_gop_append_buf(ngx_http_live_gop_node_t *gop,
+        ngx_http_live_msg_t *msg, ngx_buf_t *b, void *tag);
 
 static ngx_int_t ngx_http_live_post(ngx_http_request_t *r);
 static void ngx_http_live_post_cleanup(void *data);
-static ngx_http_live_node_t *ngx_http_live_post_rbtree_lookup(
+static ngx_http_live_post_node_t *ngx_http_live_post_rbtree_lookup(
     ngx_rbtree_t *rbtree, u_char *md5);
 static void ngx_http_live_post_rbtree_insert_value(ngx_rbtree_node_t *temp,
-    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+        ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
+static ngx_http_live_gop_node_t *ngx_http_live_gop_rbtree_lookup(
+    ngx_rbtree_t *rbtree, u_char *md5);
+static void ngx_http_live_gop_rbtree_insert_value(ngx_rbtree_node_t *temp,
+        ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel);
 static void ngx_http_live_post_read_handler(ngx_http_request_t *r);
 
 static char *ngx_http_live_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_live_init_zone(ngx_shm_zone_t *shm_zone, void *data);
 static char *ngx_http_live(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_live_active_check_handler(ngx_http_request_t *r);
+static char *ngx_http_live_active_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static ngx_int_t ngx_http_live_idle_check_handler(ngx_http_request_t *r);
+static char *ngx_http_live_idle_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static void *ngx_http_live_create_loc_conf(ngx_conf_t *cf);
 static char *ngx_http_live_merge_loc_conf(ngx_conf_t *cf, void *parent,
-    void *child);
+        void *child);
 static void *ngx_http_live_create_main_conf(ngx_conf_t *cf);
 static char *ngx_http_live_init_main_conf(ngx_conf_t *cf, void *conf);
 
@@ -120,10 +170,10 @@ static ngx_int_t ngx_http_live_init_module(ngx_cycle_t *cycle);
 static void ngx_http_live_notify_cleanup(void *data);
 static ngx_int_t ngx_http_live_init_process(ngx_cycle_t *cycle);
 static void ngx_http_live_notify_read_handler(ngx_event_t *rev);
+static void ngx_http_live_notify_process_gop(ngx_http_live_msg_t *msg, ngx_buf_t *b, size_t limit);
 static void ngx_http_live_notify_process_msg(ngx_http_live_msg_t *msg);
 static void ngx_http_live_notify_write_handler(ngx_event_t *wev);
 static ngx_int_t ngx_http_live_notify(ngx_http_request_t *r, ngx_buf_t *b);
-
 
 static ngx_conf_bitmask_t  ngx_http_live_methods_mask[] = {
     { ngx_string("get"), NGX_HTTP_GET },
@@ -134,49 +184,103 @@ static ngx_conf_bitmask_t  ngx_http_live_methods_mask[] = {
 
 static ngx_command_t  ngx_http_live_commands[] = {
 
-    { ngx_string("live_zone"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_ANY,
-      ngx_http_live_zone,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      0,
-      NULL },
+    {   ngx_string("live_zone"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_ANY,
+        ngx_http_live_zone,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        0,
+        NULL
+    },
 
-    { ngx_string("live_buffer_size"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
-      ngx_conf_set_size_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_live_main_conf_t, buffer_size),
-      NULL },
+    {   ngx_string("live_relay_buffer_size"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_size_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_live_main_conf_t, relay_buffer_size),
+        NULL
+    },
 
-    { ngx_string("live"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_http_live,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      0,
-      NULL },
+    {   ngx_string("live_buffers"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+        ngx_conf_set_bufs_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_live_main_conf_t, bufs),
+        NULL
+    },
 
-    { ngx_string("live_methods"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
-      ngx_conf_set_bitmask_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_live_loc_conf_t, methods),
-      &ngx_http_live_methods_mask },
+    { ngx_string("live_gop_cache"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_flag_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_live_main_conf_t, gop_cache),
+        NULL
+    },
 
-    { ngx_string("live_key"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-      ngx_http_set_complex_value_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_live_loc_conf_t, key),
-      NULL },
+    { ngx_string("live_hls_enabled"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_flag_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_live_main_conf_t, live_hls_enabled),
+        NULL
+    },
 
-    { ngx_string("live_buffers"),
-      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
-      ngx_conf_set_bufs_slot,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      offsetof(ngx_http_live_loc_conf_t, bufs),
-      NULL },
+    { ngx_string("live_active_check"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_http_live_active_check,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
 
-      ngx_null_command
+    { ngx_string("live_idle_check"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_http_live_idle_check,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
+
+    {   ngx_string("live"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_http_live,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        0,
+        NULL
+    },
+
+    {   ngx_string("live_methods"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE12,
+        ngx_conf_set_bitmask_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_live_loc_conf_t, methods),
+        &ngx_http_live_methods_mask
+    },
+
+    {   ngx_string("live_key"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_complex_value_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_live_loc_conf_t, key),
+        NULL
+    },
+
+    {   ngx_string("live_hls"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+        ngx_ts_hls_set_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_live_loc_conf_t, live_hls),
+        NULL
+    },
+
+    {   ngx_string("playback_hls"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+        ngx_ts_hls_set_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_live_loc_conf_t, playback_hls),
+        NULL
+    },
+
+    ngx_null_command
 };
 
 
@@ -210,10 +314,86 @@ ngx_module_t  ngx_http_live_module = {
     NGX_MODULE_V1_PADDING
 };
 
+static ngx_buf_t *
+ngx_http_live_alloc_buf(ngx_log_t *log, size_t len)
+{
+    u_char                      *p;
+    ngx_buf_t                   *buf;
+
+    p = ngx_calloc(sizeof(ngx_buf_t) + len, log);
+    if (p == NULL) {
+        return NULL;
+    }
+
+    buf = (ngx_buf_t *) p;
+    buf->start = p + sizeof(ngx_buf_t);
+    buf->pos = buf->start;
+    buf->last = buf->start;
+    buf->end = buf->start + len;
+
+    return buf;
+}
+
+ngx_flag_t ngx_http_live_actived(ngx_http_request_t *r)
+{
+    ngx_http_live_t            *live;
+    ngx_http_live_loc_conf_t   *llcf;
+
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
+
+    if (llcf && llcf->shm_zone) {
+        live = llcf->shm_zone->data;
+        return live->max_conns ? (live->sh->n_active < live->max_conns) : 1;
+    }
+
+    return 1;
+}
+
+
+ngx_flag_t ngx_http_live_existed(ngx_http_request_t *r)
+{
+    u_char                     md5[16];
+    ngx_md5_t                  md5_ctx;
+    ngx_str_t                  key;
+    ngx_http_live_t           *live;
+    ngx_http_live_post_node_t *post;
+    ngx_http_live_loc_conf_t  *llcf;
+
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
+
+    if (!llcf || !llcf->shm_zone) {
+        return 0;
+    }
+
+    live = llcf->shm_zone->data;
+
+    if (llcf->key == NULL) {
+        key = r->uri;
+    } else {
+        if (ngx_http_complex_value(r, llcf->key, &key) != NGX_OK) {
+            return 0;
+        }
+    }
+
+    ngx_md5_init(&md5_ctx);
+    ngx_md5_update(&md5_ctx, key.data, key.len);
+    ngx_md5_final(md5, &md5_ctx);
+
+    ngx_shmtx_lock(&live->shpool->mutex);
+    post = ngx_http_live_post_rbtree_lookup(&live->sh->ptree, md5);
+    ngx_shmtx_unlock(&live->shpool->mutex);
+
+    if (post == NULL) {
+        return 0;
+    }
+
+    return 1;
+}
 
 static ngx_int_t
 ngx_http_live_handler(ngx_http_request_t *r)
 {
+    ngx_int_t                  rc;
     ngx_md5_t                  md5;
     ngx_http_live_ctx_t       *ctx;
     ngx_http_live_loc_conf_t  *llcf;
@@ -228,9 +408,6 @@ ngx_http_live_handler(ngx_http_request_t *r)
         return NGX_DECLINED;
     }
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live handler");
-
     ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_live_ctx_t));
     if (ctx == NULL) {
         return NGX_ERROR;
@@ -243,15 +420,13 @@ ngx_http_live_handler(ngx_http_request_t *r)
 
     if (llcf->key == NULL) {
         ctx->key = r->uri;
-
     } else {
         if (ngx_http_complex_value(r, llcf->key, &ctx->key) != NGX_OK) {
             return NGX_ERROR;
         }
     }
 
-    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live key: \"%V\"", &ctx->key);
+    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "live key: \"%V\"", &ctx->key);
 
     ngx_md5_init(&md5);
     ngx_md5_update(&md5, ctx->key.data, ctx->key.len);
@@ -260,23 +435,22 @@ ngx_http_live_handler(ngx_http_request_t *r)
 #if (NGX_DEBUG)
     {
         u_char  hex[32];
-
         ngx_hex_dump(hex, ctx->md5, 16);
-
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http live md5: %*s", 32, hex);
+        ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0, "live md5: %*s", 32, hex);
     }
 #endif
 
     switch (r->method) {
     case NGX_HTTP_GET:
-        return ngx_http_live_get(r);
-
+        rc = ngx_http_live_get(r);
+        break;
     default: /* NGX_HTTP_POST */
-        return ngx_http_live_post(r);
+        rc = ngx_http_live_post(r);
+        break;
     }
-}
 
+    return rc;
+}
 
 static ngx_int_t
 ngx_http_live_get(ngx_http_request_t *r)
@@ -285,11 +459,10 @@ ngx_http_live_get(ngx_http_request_t *r)
     ngx_http_live_t           *live;
     ngx_pool_cleanup_t        *cln;
     ngx_http_live_ctx_t       *ctx;
-    ngx_http_live_node_t      *node;
+    ngx_http_live_post_node_t *post = NULL;
     ngx_http_live_get_node_t  *get;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live get handler");
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "live get");
 
     rc = ngx_http_discard_request_body(r);
     if (rc != NGX_OK) {
@@ -302,11 +475,11 @@ ngx_http_live_get(ngx_http_request_t *r)
 
     if (!live->persistent) {
         ngx_shmtx_lock(&live->shpool->mutex);
-        node = ngx_http_live_post_rbtree_lookup(&live->sh->rbtree, ctx->md5);
+        post = ngx_http_live_post_rbtree_lookup(&live->sh->ptree, ctx->md5);
         ngx_shmtx_unlock(&live->shpool->mutex);
 
-        if (node == NULL) {
-            ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+        if (post == NULL) {
+            ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0,
                           "live stream not found");
             return NGX_HTTP_NOT_FOUND;
         }
@@ -327,8 +500,14 @@ ngx_http_live_get(ngx_http_request_t *r)
 
     get->md5 = ctx->md5;
     get->request = r;
-
-    ngx_rbtree_insert(&live->rbtree, &get->node);
+#if (NGX_DEBUG)
+    {
+        u_char  hex[32];
+        ngx_hex_dump(hex, get->md5, 16);
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "insert get %*s", 32, hex);
+    }
+#endif
+    ngx_rbtree_insert(&live->gtree, &get->node);
 
     ctx->get = get;
 
@@ -344,6 +523,7 @@ ngx_http_live_get(ngx_http_request_t *r)
     r->write_event_handler = ngx_http_live_get_write_handler;
 
     r->main->count++;
+    live->sh->n_active++;
 
     return NGX_DONE;
 }
@@ -355,10 +535,17 @@ ngx_http_live_get_cleanup(void *data)
     ngx_http_live_ctx_t *ctx = data;
 
     if (ctx->get) {
-        ngx_rbtree_delete(&ctx->live->rbtree, &ctx->get->node);
+#if (NGX_DEBUG)
+        {
+            u_char  hex[32];
+            ngx_hex_dump(hex, ctx->get->md5, 16);
+            ngx_log_error(NGX_LOG_NOTICE, ctx->request->connection->log, 0, "delete get %*s", 32, hex);
+        }
+#endif
+        ctx->live->sh->n_active--;
+        ngx_rbtree_delete(&ctx->live->gtree, &ctx->get->node);
     }
 }
-
 
 static ngx_http_live_get_node_t *
 ngx_http_live_get_rbtree_lookup(ngx_rbtree_t *rbtree, u_char *md5)
@@ -395,17 +582,17 @@ ngx_http_live_get_rbtree_lookup(ngx_rbtree_t *rbtree, u_char *md5)
     return ret;
 }
 
-
 static void
 ngx_http_live_get_rbtree_insert_value(ngx_rbtree_node_t *temp,
-    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+                                      ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
 {
     ngx_rbtree_node_t         **p;
     ngx_http_live_get_node_t   *get, *gett;
 
+    get = (ngx_http_live_get_node_t *) node;
+
     for ( ;; ) {
-        get = (ngx_http_live_get_node_t *) &node;
-        gett = (ngx_http_live_get_node_t *) &temp;
+        gett = (ngx_http_live_get_node_t *) temp;
 
         p = ngx_memcmp(get->md5, gett->md5, 16) < 0
             ? &temp->left : &temp->right;
@@ -434,8 +621,8 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
     ngx_http_live_ctx_t       *ctx;
     ngx_http_core_loc_conf_t  *clcf;
 
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live get write handler");
+    ngx_log_debug1(NGX_LOG_DEBUG, r->connection->log, 0,
+                  "%s", __func__);
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
 
@@ -445,7 +632,7 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
     clcf = ngx_http_get_module_loc_conf(r->main, ngx_http_core_module);
 
     if (wev->timedout) {
-        ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out");
+        ngx_log_error(NGX_LOG_NOTICE, c->log, NGX_ETIMEDOUT, "client timed out");
         c->timedout = 1;
 
         ngx_http_finalize_request(r, NGX_HTTP_REQUEST_TIME_OUT);
@@ -453,8 +640,7 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
     }
 
     if (wev->delayed) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http live writer delayed");
+        ngx_log_error(NGX_LOG_INFO, c->log, 0, "live writer delayed");
 
         if (ngx_handle_write_event(wev, clcf->send_lowat) != NGX_OK) {
             ngx_http_finalize_request(r, NGX_ERROR);
@@ -466,7 +652,7 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
     rc = ngx_http_output_filter(r, ctx->out);
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                   "http live output filter rc:%i", rc);
+                   "live output filter rc:%i", rc);
 
     if (rc == NGX_ERROR) {
         ngx_http_finalize_request(r, rc);
@@ -477,16 +663,15 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
                             &ctx->out, &ngx_http_live_module);
 
     if (ctx->done) {
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "http live close stream");
-        ngx_http_finalize_request(r, ngx_http_send_special(r, NGX_HTTP_LAST));
+        ngx_log_error(NGX_LOG_NOTICE, c->log, 0,
+                      "live close stream");
+        ngx_http_finalize_request(r, NGX_DONE);
         return;
     }
 
     if (!wev->delayed) {
         if (r->buffered || r->postponed || (r == r->main && c->buffered)) {
             ngx_add_timer(wev, clcf->send_timeout);
-
         } else if (wev->timer_set) {
             ngx_del_timer(wev);
         }
@@ -497,104 +682,25 @@ ngx_http_live_get_write_handler(ngx_http_request_t *r)
     }
 }
 
-
-static void
-ngx_http_live_get_data_handler(ngx_http_request_t *r, u_char *p, size_t size,
-    ngx_uint_t counter, ngx_uint_t last)
-{
-    size_t                     n;
-    ngx_buf_t                 *b;
-    ngx_chain_t               *cl, **ll;
-    ngx_http_live_t           *live;
-    ngx_http_live_ctx_t       *ctx;
-    ngx_http_live_loc_conf_t  *llcf;
-
-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live get data n:%uz, l:%ui", size, last);
-
-    ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
-    if (ctx == NULL) {
-        return;
-    }
-
-    if (ctx->done) {
-        return;
-    }
-
-    live = ctx->live;
-
-    if (live->consistent && ctx->counter != counter) {
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "live inconsistency: %ui/%ui", counter, ctx->counter);
-        ctx->done = 1;
-        return;
-    }
-
-    if (!live->persistent && last) {
-        ctx->done = 1;
-    }
-
-    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
-
-    for (ll = &ctx->out; *ll; ll = &(*ll)->next);
-
-    while (size) {
-        if (ctx->free) {
-            cl = ctx->free;
-            ctx->free = cl->next;
-
-        } else if (ctx->allocated < (ngx_uint_t) llcf->bufs.num) {
-            cl = ngx_alloc_chain_link(r->pool);
-            if (cl == NULL) {
-                return;
-            }
-
-            cl->buf = ngx_create_temp_buf(r->pool, llcf->bufs.size);
-            if (cl->buf == NULL) {
-                return;
-            }
-
-            ctx->allocated++;
-
-        } else {
-            return;
-        }
-
-        *ll = cl;
-        ll = &cl->next;
-        cl->next = NULL;
-
-        n = size > llcf->bufs.size ? llcf->bufs.size : size;
-
-        b = cl->buf;
-        b->tag = &ngx_http_live_module;
-        b->flush = live->flush;
-        b->pos = b->start;
-        b->last = ngx_cpymem(b->pos, p, n);
-
-        p += n;
-        size -= n;
-    }
-
-    ctx->counter = last ? 0 : counter + 1;
-}
-
-
 static ngx_int_t
 ngx_http_live_post(ngx_http_request_t *r)
 {
-    u_char                     *p;
+    size_t                      len;
+    ngx_pid_t                   gid;
     ngx_int_t                   rc;
     ngx_http_live_t            *live;
     ngx_pool_cleanup_t         *cln;
     ngx_http_live_ctx_t        *ctx;
-    ngx_http_live_node_t       *node;
+    ngx_http_live_post_node_t  *post;
     ngx_http_live_main_conf_t  *lmcf;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live post handler");
+    ngx_http_live_loc_conf_t   *llcf;
+    ngx_uint_t                  n;
+    ngx_str_t                   do_hls;
+    ngx_str_t                   stream_name;
+    ngx_http_live_msg_t         *msg;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
+    ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "live post");
 
     lmcf = ngx_http_get_module_main_conf(r, ngx_http_live_module);
 
@@ -606,46 +712,98 @@ ngx_http_live_post(ngx_http_request_t *r)
     cln->handler = ngx_http_live_post_cleanup;
     cln->data = ctx;
 
-    p = ngx_alloc(sizeof(ngx_buf_t) + lmcf->buffer_size, r->connection->log);
-    if (p == NULL) {
+    len = lmcf->buffer_size;
+    ctx->buf = ngx_http_live_alloc_buf(r->connection->log, len);
+    if (ctx->buf == NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "failed alloc live post buf");
         return NGX_ERROR;
     }
 
-    ctx->buf = (ngx_buf_t *) p;
-    ngx_memzero(ctx->buf, sizeof(ngx_buf_t));
-
+    ctx->do_hls_live = lmcf->live_hls_enabled;
     ctx->buf->tag = (ngx_buf_tag_t *) r;
-    ctx->buf->start = p + sizeof(ngx_buf_t);
-    ctx->buf->pos = ctx->buf->start;
-    ctx->buf->last = ctx->buf->start;
-    ctx->buf->end = ctx->buf->start + lmcf->buffer_size;
+    ctx->buf->last = ctx->buf->pos + offsetof(ngx_http_live_msg_t, data);
+    msg = (ngx_http_live_msg_t *) ctx->buf->pos;
+    msg->live = ctx->live;
+    ngx_memcpy(msg->md5, ctx->md5, 16);
 
     live = ctx->live;
-
     ngx_shmtx_lock(&live->shpool->mutex);
 
-    node = ngx_http_live_post_rbtree_lookup(&live->sh->rbtree, ctx->md5);
-    if (node) {
-        ngx_shmtx_unlock(&live->shpool->mutex);
-
-        ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "live stream \"%V\" already exists", &ctx->key);
-        return NGX_HTTP_CONFLICT;
+    post = ngx_http_live_post_rbtree_lookup(&live->sh->ptree, ctx->md5);
+    if (post) {
+        gid = getpgid(post->pid);
+        if (gid == -1) {
+            ngx_rbtree_delete(&live->sh->ptree, &post->node);
+            ngx_slab_free_locked(live->shpool, post);
+        } else {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                        "live stream \"%V\" already exists on worker:%P", &ctx->key, post->pid);
+            ngx_shmtx_unlock(&live->shpool->mutex);
+            return NGX_HTTP_CONFLICT;
+        }
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                      "drop live stream \"%V\" on exited worker:%P", &ctx->key, post->pid);
     }
 
-    node = ngx_slab_calloc_locked(live->shpool, sizeof(ngx_http_live_node_t));
-    if (node == NULL) {
+    post = ngx_slab_calloc_locked(live->shpool, sizeof(ngx_http_live_post_node_t));
+    if (post == NULL) {
         ngx_shmtx_unlock(&live->shpool->mutex);
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    ngx_memcpy(node->md5, ctx->md5, 16);
+    ngx_memcpy(post->md5, ctx->md5, 16);
+    post->pid = ngx_log_pid;
 
-    ngx_rbtree_insert(&live->sh->rbtree, &node->node);
+#if (NGX_DEBUG)
+    {
+        u_char  hex[32];
+        ngx_hex_dump(hex, post->md5, 16);
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "insert post %*s", 32, hex);
+    }
+#endif
+    ngx_rbtree_insert(&live->sh->ptree, &post->node);
 
     ngx_shmtx_unlock(&live->shpool->mutex);
 
-    ctx->node = node;
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
+
+    if (lmcf->gop_cache || llcf->live_hls || llcf->playback_hls) {
+        ctx->ts = ngx_pcalloc(r->pool, sizeof(ngx_ts_stream_t));
+        if (ctx->ts == NULL) {
+            return NGX_ERROR;
+        }
+
+        ctx->ts->pool = r->pool;
+        ctx->ts->log = r->connection->log;
+    }
+
+    if (ngx_http_arg(r, (u_char *) "playback_hls", sizeof("playback_hls") - 1, &do_hls) == NGX_OK) {
+        if (ngx_strncmp(do_hls.data, "true", ngx_max(do_hls.len, 4)) == 0) {
+            ctx->do_hls_playback = 1;
+        }
+    }
+    if (ngx_http_arg(r, (u_char *) "live_hls", sizeof("live_hls") - 1, &do_hls) == NGX_OK) {
+        if (ngx_strncmp(do_hls.data, "true", ngx_max(do_hls.len, 4)) == 0) {
+            ctx->do_hls_live = 1;
+        }
+    }
+
+    if (llcf->live_hls || llcf->playback_hls) {
+        for (n = 0; n < r->uri.len; n++) {
+            if (r->uri.data[r->uri.len - 1 - n] == '/') {
+                break;
+            }
+        }
+
+        stream_name.data = &r->uri.data[r->uri.len - n];
+        stream_name.len = n;
+        if (ctx->do_hls_live)
+            ngx_ts_hls_create(llcf->live_hls, ctx->ts, &stream_name);
+        if (ctx->do_hls_playback)
+            ngx_ts_hls_create(llcf->playback_hls, ctx->ts, &stream_name);
+    }
+
+    ctx->post = post;
 
     r->request_body_no_buffering = 1;
 
@@ -665,67 +823,70 @@ ngx_http_live_post_cleanup(void *data)
     ngx_http_live_ctx_t *ctx = data;
 
     size_t                n;
-    u_char               *p;
     ngx_buf_t            *b;
     ngx_http_live_t      *live;
     ngx_http_live_msg_t  *msg;
+    ngx_http_live_main_conf_t   *lmcf;
 
-    if (ctx->node) {
-        live = ctx->live;
+    live = ctx->live;
+    if (ctx->post) {
 
-        if (!ctx->last_sent) {
-            n = offsetof(ngx_http_live_msg_t, data);
-            p = ngx_alloc(sizeof(ngx_buf_t) + n, ngx_cycle->log);
+        n = offsetof(ngx_http_live_msg_t, data);
+        b = ngx_http_live_alloc_buf(ngx_cycle->log, n);
 
-            if (p) {
-                b = (ngx_buf_t *) p;
-                ngx_memzero(b, sizeof(ngx_buf_t));
-                b->pos = p + sizeof(ngx_buf_t);
-                b->last = b->pos + n;
+        if (b) {
+            b->last = b->pos + n;
+            msg = (ngx_http_live_msg_t *) b->pos;
+            msg->size = n;
+            msg->live = live;
+            msg->counter = ctx->counter++;
+            msg->last = 1;
+            ngx_memcpy(msg->md5, ctx->md5, 16);
 
-                msg = (ngx_http_live_msg_t *) b->pos;
-                msg->size = n;
-                msg->live = live;
-                msg->counter = ctx->counter++;
-                msg->last = 1;
-                ngx_memcpy(msg->md5, ctx->md5, 16);
-
-                if (ngx_http_live_notify(ctx->request, b) != NGX_OK) {
-                    ngx_free(b);
-                }
+            lmcf = ngx_http_get_module_main_conf(ctx->request, ngx_http_live_module);
+            if (lmcf->gop_cache) {
+                ngx_http_live_notify_process_gop(msg, b, lmcf->buffer_limit);
+            } else {
+                ngx_http_live_notify_process_msg(msg);
+            }
+            if (ngx_http_live_notify(ctx->request, b) != NGX_OK) {
+                ngx_log_error(NGX_LOG_NOTICE, ctx->request->connection->log, 0, "last live notify error");
             }
         }
 
         ngx_shmtx_lock(&live->shpool->mutex);
-        ngx_rbtree_delete(&live->sh->rbtree, &ctx->node->node);
-        ngx_slab_free_locked(live->shpool, ctx->node);
+#if (NGX_DEBUG)
+        {
+            u_char  hex[32];
+            ngx_hex_dump(hex, ctx->post->md5, 16);
+            ngx_log_error(NGX_LOG_NOTICE, ctx->request->connection->log, 0, "delete post %*s", 32, hex);
+        }
+#endif
+        ngx_rbtree_delete(&live->sh->ptree, &ctx->post->node);
+        ngx_slab_free_locked(live->shpool, ctx->post);
         ngx_shmtx_unlock(&live->shpool->mutex);
     }
 
     if (ctx->buf) {
         if (ctx->buf->file_pos) {
             ctx->buf->tag = NULL;
-        } else {
-            ngx_free(ctx->buf);
         }
-
-        ctx->buf = NULL;
     }
 }
 
 
-static ngx_http_live_node_t *
+static ngx_http_live_post_node_t *
 ngx_http_live_post_rbtree_lookup(ngx_rbtree_t *rbtree, u_char *md5)
 {
-    ngx_int_t              rc;
-    ngx_rbtree_node_t     *node, *sentinel;
-    ngx_http_live_node_t  *n;
+    ngx_int_t              	     rc;
+    ngx_rbtree_node_t     	    *node, *sentinel;
+    ngx_http_live_post_node_t   *n;
 
     node = rbtree->root;
     sentinel = rbtree->sentinel;
 
     while (node != sentinel) {
-        n = (ngx_http_live_node_t *) node;
+        n = (ngx_http_live_post_node_t *) node;
 
         rc = ngx_memcmp(md5, n->md5, 16);
 
@@ -748,14 +909,15 @@ ngx_http_live_post_rbtree_lookup(ngx_rbtree_t *rbtree, u_char *md5)
 
 static void
 ngx_http_live_post_rbtree_insert_value(ngx_rbtree_node_t *temp,
-    ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+                                       ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
 {
-    ngx_rbtree_node_t     **p;
-    ngx_http_live_node_t   *n, *nt;
+    ngx_rbtree_node_t          **p;
+    ngx_http_live_post_node_t   *n, *nt;
+
+    n = (ngx_http_live_post_node_t *) node;
 
     for ( ;; ) {
-        n = (ngx_http_live_node_t *) &node;
-        nt = (ngx_http_live_node_t *) &temp;
+        nt = (ngx_http_live_post_node_t *) temp;
 
         p = ngx_memcmp(n->md5, nt->md5, 16) < 0 ? &temp->left : &temp->right;
 
@@ -773,18 +935,128 @@ ngx_http_live_post_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbt_red(node);
 }
 
+static ngx_http_live_gop_node_t *
+ngx_http_live_gop_rbtree_lookup(ngx_rbtree_t *rbtree, u_char *md5)
+{
+    ngx_int_t              	     rc;
+    ngx_rbtree_node_t     	    *node, *sentinel;
+    ngx_http_live_gop_node_t    *n;
+
+    node = rbtree->root;
+    sentinel = rbtree->sentinel;
+
+    while (node != sentinel) {
+        n = (ngx_http_live_gop_node_t *) node;
+
+        rc = ngx_memcmp(md5, n->md5, 16);
+
+        if (rc < 0) {
+            node = node->left;
+            continue;
+        }
+
+        if (rc > 0) {
+            node = node->right;
+            continue;
+        }
+
+        return n;
+    }
+
+    return NULL;
+}
+
+
+static void
+ngx_http_live_gop_rbtree_insert_value(ngx_rbtree_node_t *temp,
+                                       ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
+{
+    ngx_rbtree_node_t          **p;
+    ngx_http_live_gop_node_t    *n, *nt;
+
+    n = (ngx_http_live_gop_node_t *) node;
+
+    for ( ;; ) {
+        nt = (ngx_http_live_gop_node_t *) temp;
+
+        p = ngx_memcmp(n->md5, nt->md5, 16) < 0 ? &temp->left : &temp->right;
+
+        if (*p == sentinel) {
+            break;
+        }
+
+        temp = *p;
+    }
+
+    *p = node;
+    node->parent = temp;
+    node->left = sentinel;
+    node->right = sentinel;
+    ngx_rbt_red(node);
+}
+
+static ngx_int_t
+ngx_http_live_post_ts_index_tables(ngx_http_request_t *r)
+{
+    size_t                      len;
+    ngx_buf_t                   *buf;
+    ngx_chain_t                 *cl;
+    ngx_http_live_ctx_t         *ctx;
+    ngx_http_live_msg_t         *msg;
+    ngx_http_live_main_conf_t   *lmcf;
+
+    len = 0;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
+    lmcf = ngx_http_get_module_main_conf(r, ngx_http_live_module);
+
+    if (ngx_ts_build_index_tables(ctx->ts) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    len = offsetof(ngx_http_live_msg_t, data);
+    for (cl = ctx->ts->index_tables; cl; cl = cl->next) {
+        len += cl->buf->last - cl->buf->pos;
+    }
+
+    buf = ngx_http_live_alloc_buf(r->connection->log, len);
+    if (buf == NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0, "failed alloc live ts index buf:%ui", len);
+        return NGX_ERROR;
+    }
+
+    buf->last = buf->pos + offsetof(ngx_http_live_msg_t, data);
+    msg = (ngx_http_live_msg_t *) buf->pos;
+    msg->live = ctx->live;
+    msg->flag = PKT_TS_INDEX;
+    ngx_memcpy(msg->md5, ctx->md5, 16);
+
+    for (cl = ctx->ts->index_tables; cl; cl = cl->next) {
+        ngx_memmove(buf->last, cl->buf->pos, cl->buf->last - cl->buf->pos);
+        buf->last += cl->buf->last - cl->buf->pos;
+    }
+    msg->size = buf->last - buf->pos;
+
+    ngx_http_live_notify_process_gop(msg, buf, lmcf->buffer_limit);
+
+    return ngx_http_live_notify(r, buf);
+}
 
 static void
 ngx_http_live_post_read_handler(ngx_http_request_t *r)
 {
-    size_t                    n, left;
-    ngx_int_t                 rc;
-    ngx_buf_t                *b;
-    ngx_chain_t              *cl;
-    ngx_event_t              *rev;
-    ngx_http_live_msg_t      *msg;
-    ngx_http_live_ctx_t      *ctx;
-    ngx_http_request_body_t  *rb;
+    size_t                       n, left, kpos;
+    ngx_int_t                    rc;
+    ngx_uint_t                   flag;
+    ngx_buf_t                   *b;
+    ngx_chain_t                 *cl;
+    ngx_event_t                 *rev;
+    ngx_http_live_msg_t         *msg;
+    ngx_http_live_ctx_t         *ctx;
+    ngx_http_request_body_t     *rb;
+    ngx_http_live_main_conf_t   *lmcf;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
+    lmcf = ngx_http_get_module_main_conf(r, ngx_http_live_module);
 
     if (ngx_exiting || ngx_terminate) {
         ngx_http_finalize_request(r, NGX_HTTP_CLOSE);
@@ -793,11 +1065,9 @@ ngx_http_live_post_read_handler(ngx_http_request_t *r)
 
     rev = r->connection->read;
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
-
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                   "http live post read handler d:%d, r:%O",
-                   rev->delayed, ctx->buf->file_pos);
+                  "live post read handler d:%d, r:%O",
+                  rev->delayed, ctx->buf->file_pos);
 
     if (rev->delayed || ctx->buf->file_pos) {
         if (ngx_handle_read_event(rev, 0) != NGX_OK) {
@@ -812,12 +1082,18 @@ ngx_http_live_post_read_handler(ngx_http_request_t *r)
         return;
     }
 
+    flag = 0;
     b = ctx->buf;
-    b->pos = b->start;
-    b->last = b->pos + offsetof(ngx_http_live_msg_t, data);
+    msg = (ngx_http_live_msg_t *) b->pos;
 
-    for ( ;; ) {
-        if (rb->bufs == NULL && r->reading_body) {
+    if (b->last == b->end) {
+        b->pos = b->start;
+        b->last = b->pos + offsetof(ngx_http_live_msg_t, data);
+        msg->flag = 0;
+    }
+
+    for ( ;r->reading_body; ) {
+        if (rb->bufs == NULL) {
             rc = ngx_http_read_unbuffered_request_body(r);
 
             if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
@@ -839,7 +1115,6 @@ ngx_http_live_post_read_handler(ngx_http_request_t *r)
         }
 
         b->last = ngx_cpymem(b->last, cl->buf->pos, n);
-
         cl->buf->pos += n;
 
         if (b->last == b->end) {
@@ -850,38 +1125,49 @@ ngx_http_live_post_read_handler(ngx_http_request_t *r)
         ngx_free_chain(r->pool, cl);
     }
 
-    if (b->last != b->pos + offsetof(ngx_http_live_msg_t, data)) {
-        msg = (ngx_http_live_msg_t *) b->pos;
-        msg->size = b->last - b->pos;
-        msg->live = ctx->live;
-        msg->counter = ctx->counter++;
-        msg->last = (rb->bufs || r->reading_body) ? 0 : 1;
-        ngx_memcpy(msg->md5, ctx->md5, 16);
+    if (b->last == b->end) {
+        kpos = 0;
+        if (ctx->ts) {
+            ngx_ts_read_buf(ctx->ts, &msg->data[0], b->end - b->pos - offsetof(ngx_http_live_msg_t, data), &flag, &kpos);
+        }
 
+        if (!ctx->ts->index_tables && lmcf->gop_cache && flag == PKT_KEY_FLAG) {
+            // send pat pmt first
+            ngx_http_live_post_ts_index_tables(r);
+        }
+
+        msg->size = b->last - b->pos;
+        msg->kpos = kpos;
+        msg->counter = ctx->counter++;
+        msg->expired = 0;
+        msg->last = (rb->bufs || r->reading_body) ? 0 : 1;
+        msg->flag = flag;
+
+        if (lmcf->gop_cache) {
+            ngx_http_live_notify_process_gop(msg, b, lmcf->buffer_limit);
+        } else {
+            ngx_http_live_notify_process_msg(msg);
+        }
         rc = ngx_http_live_notify(r, b);
-        if (rc == NGX_ERROR) {
+        if (rc != NGX_OK) {
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         }
-
-        if (msg->last) {
-            ctx->last_sent = 1;
-        }
     }
 
-    if (rb->bufs) {
-        r->read_event_handler = ngx_http_live_post_read_handler;
-        ngx_add_timer(rev, 1);
-        rev->delayed = 1;
-        return;
-    }
 
     if (r->reading_body) {
+        if (rb->bufs) {
+            r->read_event_handler = ngx_http_live_post_read_handler;
+            ngx_add_timer(rev, 1);
+            rev->delayed = 1;
+            return;
+        }
         r->read_event_handler = ngx_http_live_post_read_handler;
         return;
     }
 
-    ngx_http_finalize_request(r, NGX_HTTP_NO_CONTENT);
+    ngx_http_finalize_request(r, NGX_HTTP_CLOSE);
 }
 
 
@@ -893,7 +1179,7 @@ ngx_http_live_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     size_t            size;
     u_char           *p;
     ngx_str_t         s, name, *value;
-    ngx_uint_t        i;
+    ngx_uint_t        i, max_conns;
     ngx_shm_zone_t   *shm_zone;
     ngx_http_live_t  *live;
 
@@ -902,11 +1188,14 @@ ngx_http_live_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    ngx_rbtree_init(&live->rbtree, &live->sentinel,
+    ngx_rbtree_init(&live->gtree, &live->sentinel,
                     ngx_http_live_get_rbtree_insert_value);
+    ngx_rbtree_init(&live->btree, &live->bsentinel,
+                    ngx_http_live_gop_rbtree_insert_value);
 
     name.len = 0;
     size = 0;
+    max_conns = 0;
 
     value = cf->args->elts;
 
@@ -937,13 +1226,19 @@ ngx_http_live_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
 
-        if (ngx_strcmp(value[i].data, "persistent") == 0) {
-            live->persistent = 1;
-            continue;
+        if (ngx_strncmp(value[i].data, "max_conns=", 10) == 0) {
+            s.len = value[i].len - 10;
+            s.data = value[i].data + 10;
+
+            max_conns = ngx_atoi(s.data, s.len);
+            if (max_conns != (ngx_uint_t) NGX_ERROR) {
+                live->max_conns = max_conns;
+                continue;
+            }
         }
 
-        if (ngx_strcmp(value[i].data, "consistent") == 0) {
-            live->consistent = 1;
+        if (ngx_strcmp(value[i].data, "persistent") == 0) {
+            live->persistent = 1;
             continue;
         }
 
@@ -980,6 +1275,7 @@ ngx_http_live_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     shm_zone->noreuse = 1;
 
     lmcf->enabled = 1;
+    lmcf->live = live;
 
     return NGX_CONF_OK;
 }
@@ -1000,19 +1296,19 @@ ngx_http_live_init_zone(ngx_shm_zone_t *shm_zone, void *data)
         return NGX_OK;
     }
 
-    live->sh = ngx_slab_alloc(live->shpool, sizeof(ngx_http_live_sh_t));
+    live->sh = ngx_slab_calloc(live->shpool, sizeof(ngx_http_live_sh_t));
     if (live->sh == NULL) {
         return NGX_ERROR;
     }
 
     live->shpool->data = live->sh;
 
-    ngx_rbtree_init(&live->sh->rbtree, &live->sh->sentinel,
+    ngx_rbtree_init(&live->sh->ptree, &live->sh->sentinel,
                     ngx_http_live_post_rbtree_insert_value);
 
     len = sizeof(" in live zone \"\"") + shm_zone->shm.name.len;
 
-    live->shpool->log_ctx = ngx_slab_alloc(live->shpool, len);
+    live->shpool->log_ctx = ngx_slab_calloc(live->shpool, len);
     if (live->shpool->log_ctx == NULL) {
         return NGX_ERROR;
     }
@@ -1023,6 +1319,298 @@ ngx_http_live_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
+
+static ngx_int_t
+ngx_http_set_header_helper(ngx_http_request_t *r,
+    ngx_str_t *key, ngx_str_t *value,
+    ngx_table_elt_t **output_header, ngx_flag_t no_create)
+{
+    ngx_table_elt_t             *h;
+    ngx_list_part_t             *part;
+    ngx_uint_t                   i, hash;
+    ngx_flag_t                   matched = 0;
+
+    hash = ngx_hash_key(value->data, value->len);
+    part = &r->headers_out.headers.part;
+    h = part->elts;
+
+    for (i = 0; /* void */; i++) {
+
+        if (i >= part->nelts) {
+            if (part->next == NULL) {
+                break;
+            }
+
+            part = part->next;
+            h = part->elts;
+            i = 0;
+        }
+
+        if (h[i].hash == 0) {
+            continue;
+        }
+
+        if (h[i].key.len == key->len
+            && ngx_strncasecmp(h[i].key.data, key->data,
+                               h[i].key.len) == 0)
+        {
+            goto matched;
+        }
+
+        if (h[i].key.len >= key->len - 1
+            && ngx_strncasecmp(h[i].key.data, key->data,
+                               key->len - 1) == 0)
+        {
+            goto matched;
+        }
+
+        /* not matched */
+        continue;
+
+matched:
+
+        if (value->len == 0 || matched) {
+
+            h[i].value.len = 0;
+            h[i].hash = 0;
+
+        } else {
+            h[i].value = *value;
+            h[i].hash = hash;
+        }
+
+        if (output_header) {
+            *output_header = &h[i];
+        }
+
+        matched = 1;
+    }
+
+    if (matched){
+        return NGX_OK;
+    }
+
+    if (no_create && value->len == 0) {
+        return NGX_OK;
+    }
+
+    /* XXX we still need to create header slot even if the value
+     * is empty because some builtin headers like Last-Modified
+     * relies on this to get cleared */
+
+    h = ngx_list_push(&r->headers_out.headers);
+    if (h == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (value->len == 0) {
+        h->hash = 0;
+
+    } else {
+        h->hash = hash;
+    }
+
+    h->key = *key;
+    h->value = *value;
+
+    h->lowcase_key = ngx_pnalloc(r->pool, h->key.len);
+    if (h->lowcase_key == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_strlow(h->lowcase_key, h->key.data, h->key.len);
+
+    if (output_header) {
+        *output_header = h;
+    }
+
+    return NGX_OK;
+}
+
+static ngx_int_t
+ngx_http_live_active_check_handler(ngx_http_request_t *r)
+{
+    u_char                             *pos;
+    ngx_str_t                           key, value;
+    ngx_int_t                           rc;
+    ngx_buf_t                          *b;
+    ngx_uint_t                          num;
+    ngx_chain_t                         out;
+    ngx_http_live_t                    *live;
+    ngx_http_live_loc_conf_t           *llcf;
+
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    r->headers_out.status = NGX_HTTP_OK;
+
+    num = 0;
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
+
+    if (llcf && llcf->shm_zone) {
+        live = llcf->shm_zone->data;
+        num = live->sh->n_active;
+    }
+
+    ngx_str_set(&key, "Conns");
+    value.data = ngx_pnalloc(r->pool, sizeof(ngx_uint_t) + 1);
+    if (value.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    pos = ngx_sprintf(value.data, "%ui", num);
+    value.len = pos - value.data;
+    ngx_http_set_header_helper(r, &key, &value, NULL, 0);
+
+    if (r->method == NGX_HTTP_HEAD) {
+        rc = ngx_http_send_header(r);
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, sizeof(ngx_uint_t) + 1);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->last = ngx_sprintf(b->last, "%ui", num);
+
+    out.buf = b;
+    out.next = NULL;
+
+    r->headers_out.content_length_n = b->last - b->pos;
+
+    b->last_buf = 1;
+
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, &out);
+}
+
+static char *
+ngx_http_live_active_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *clcf;
+    ngx_http_live_loc_conf_t  *llcf = conf;
+
+    value = cf->args->elts;
+
+    llcf->shm_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                           &ngx_http_live_module);
+    if (llcf->shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_live_active_check_handler;
+
+    return NGX_CONF_OK;
+}
+
+
+static ngx_int_t
+ngx_http_live_idle_check_handler(ngx_http_request_t *r)
+{
+    u_char                             *pos;
+    ngx_str_t                           key, value;
+    ngx_int_t                           rc;
+    ngx_buf_t                          *b;
+    ngx_uint_t                          num, idle, max_conns;
+    ngx_chain_t                         out;
+    ngx_http_live_t                    *live;
+    ngx_http_live_loc_conf_t           *llcf;
+
+    if (r->method != NGX_HTTP_GET && r->method != NGX_HTTP_HEAD) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    rc = ngx_http_discard_request_body(r);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    num = 0;
+    idle = 100;
+    max_conns = 0;
+    llcf = ngx_http_get_module_loc_conf(r, ngx_http_live_module);
+
+    if (llcf && llcf->shm_zone) {
+        live = llcf->shm_zone->data;
+        num = live->sh->n_active;
+        max_conns = live->max_conns;
+        idle = (max_conns && num > max_conns) ? 0 : (100 - num * 100 / max_conns);
+    }
+
+    r->headers_out.status = (max_conns && num > max_conns) ? NGX_HTTP_TOO_MANY_REQUESTS : NGX_HTTP_OK;
+
+    ngx_str_set(&key, "Idle");
+    value.data = ngx_pnalloc(r->pool, sizeof(ngx_uint_t) + 1);
+    if (value.data == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    pos = ngx_sprintf(value.data, "%ui", idle);
+    value.len = pos - value.data;
+    ngx_http_set_header_helper(r, &key, &value, NULL, 0);
+
+    if (r->method == NGX_HTTP_HEAD) {
+        rc = ngx_http_send_header(r);
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, sizeof(ngx_uint_t) + 1);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    b->last = ngx_sprintf(b->last, "%ui", idle);
+
+    out.buf = b;
+    out.next = NULL;
+
+    r->headers_out.content_length_n = b->last - b->pos;
+
+    b->last_buf = 1;
+
+    rc = ngx_http_send_header(r);
+
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
+        return rc;
+    }
+
+    return ngx_http_output_filter(r, &out);
+}
+
+static char *
+ngx_http_live_idle_check(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_str_t                 *value;
+    ngx_http_core_loc_conf_t  *clcf;
+    ngx_http_live_loc_conf_t  *llcf = conf;
+
+    value = cf->args->elts;
+
+    llcf->shm_zone = ngx_shared_memory_add(cf, &value[1], 0,
+                                           &ngx_http_live_module);
+    if (llcf->shm_zone == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
+    clcf->handler = ngx_http_live_idle_check_handler;
+
+    return NGX_CONF_OK;
+}
 
 static char *
 ngx_http_live(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
@@ -1047,7 +1635,6 @@ ngx_http_live(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
 static void *
 ngx_http_live_create_loc_conf(ngx_conf_t *cf)
 {
@@ -1057,6 +1644,9 @@ ngx_http_live_create_loc_conf(ngx_conf_t *cf)
     if (llcf == NULL) {
         return NULL;
     }
+
+    llcf->live_hls = NGX_CONF_UNSET_PTR;
+    llcf->playback_hls = NGX_CONF_UNSET_PTR;
 
     /*
      * set by ngx_pcalloc():
@@ -1083,7 +1673,8 @@ ngx_http_live_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
         conf->key = prev->key;
     }
 
-    ngx_conf_merge_bufs_value(conf->bufs, prev->bufs, 8, 8192);
+    ngx_conf_merge_ptr_value(conf->live_hls, prev->live_hls, NULL);
+    ngx_conf_merge_ptr_value(conf->playback_hls, prev->playback_hls, NULL);
 
     return NGX_CONF_OK;
 }
@@ -1099,7 +1690,11 @@ ngx_http_live_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
+    lmcf->relay_buffer_size = NGX_CONF_UNSET_SIZE;
     lmcf->buffer_size = NGX_CONF_UNSET_SIZE;
+    lmcf->gop_cache = NGX_CONF_UNSET;
+    lmcf->live_hls_enabled = NGX_CONF_UNSET;
+    lmcf->check_period = NGX_CONF_UNSET_MSEC;
 
     /*
      * set by ngx_pcalloc()
@@ -1109,7 +1704,7 @@ ngx_http_live_create_main_conf(ngx_conf_t *cf)
      *     lmcf->nfd = 0;
      *     lmcf->buf = NULL;
      *     lmcf->enabled = 0;
-     *     
+     *
      */
 
     return lmcf;
@@ -1121,7 +1716,14 @@ ngx_http_live_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_live_main_conf_t *lmcf = conf;
 
-    ngx_conf_init_size_value(lmcf->buffer_size, 0);
+    ngx_conf_init_value(lmcf->gop_cache, 1);
+    ngx_conf_init_value(lmcf->live_hls_enabled, 0);
+    ngx_conf_init_value(lmcf->bufs.num, 128);
+    ngx_conf_init_size_value(lmcf->bufs.size, 1316 * 3);
+    ngx_conf_init_size_value(lmcf->relay_buffer_size, 102400);
+    ngx_conf_init_size_value(lmcf->buffer_size, 1316 * 3);
+    ngx_conf_init_size_value(lmcf->buffer_limit, 1316 * 3 * 384);
+    ngx_conf_init_msec_value(lmcf->check_period, 10000);
 
     return NGX_CONF_OK;
 }
@@ -1131,7 +1733,7 @@ static ngx_int_t
 ngx_http_live_init_module(ngx_cycle_t *cycle)
 {
     int                         value;
-    size_t                      buffer_size;
+    size_t                      size;
     socklen_t                   olen;
     ngx_uint_t                  n, nfd;
     ngx_socket_t               *fd, fds[2];
@@ -1147,16 +1749,6 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
 
     ccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
 
-    nfd = ccf->worker_processes;
-
-    fd = ngx_palloc(cycle->pool, nfd * 2 * sizeof(ngx_socket_t));
-    if (fd == NULL) {
-        return NGX_ERROR;
-    }
-
-    lmcf->read_fd = fd;
-    lmcf->write_fd = fd + nfd;
-
     cln = ngx_pool_cleanup_add(cycle->pool, 0);
     if (cln == NULL) {
         return NGX_ERROR;
@@ -1165,7 +1757,18 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
     cln->handler = ngx_http_live_notify_cleanup;
     cln->data = lmcf;
 
-    buffer_size = 0;
+    size = 0;
+    nfd = ccf->master ? ccf->worker_processes : 0;
+
+    if (nfd > 0) {
+        fd = ngx_pcalloc(cycle->pool, nfd * 2 * sizeof(ngx_socket_t));
+        if (fd == NULL) {
+            return NGX_ERROR;
+        }
+
+        lmcf->read_fd = fd;
+        lmcf->write_fd = fd + nfd;
+    }
 
     for (n = 0; n < nfd; n++) {
         if (socketpair(AF_UNIX,
@@ -1181,9 +1784,9 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
             return NGX_ERROR;
         }
 
-        ngx_log_error(NGX_LOG_INFO, cycle->log, 0,
-                       "http live socketpair w:%d, %d<-%d",
-                       n, (int) fds[0], (int) fds[1]);
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "live socketpair p:%d, r:%d <= w:%d",
+                      n, (int) fds[0], (int) fds[1]);
 
         lmcf->read_fd[n] = fds[0];
         lmcf->write_fd[n] = fds[1];
@@ -1191,18 +1794,18 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
         lmcf->nfd++;
 
         if (ngx_nonblocking(fds[0]) == -1
-            || ngx_nonblocking(fds[1]) == -1)
+                || ngx_nonblocking(fds[1]) == -1)
         {
             ngx_log_error(NGX_LOG_ALERT, cycle->log, ngx_socket_errno,
                           ngx_nonblocking_n " failed");
             return NGX_ERROR;
         }
 
-        if (lmcf->buffer_size) {
-            value = lmcf->buffer_size;
+        if (lmcf->relay_buffer_size) {
+            value = lmcf->relay_buffer_size;
 
             if (setsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &value, sizeof(int))
-                == -1)
+                    == -1)
             {
                 ngx_log_error(NGX_LOG_CRIT, cycle->log, ngx_socket_errno,
                               "setsockopt(SO_SNDBUF) live notify failed");
@@ -1210,7 +1813,7 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
             }
         }
 
-        if (buffer_size == 0) {
+        if (size == 0) {
             olen = sizeof(int);
 
             if (getsockopt(fds[1], SOL_SOCKET, SO_SNDBUF, &value, &olen) == -1) {
@@ -1230,7 +1833,7 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
              * It should not exceed (net.local.dgram.recvspace - 16).
              */
 
-            buffer_size = value;
+            size = value;
 
 #if (NGX_LINUX)
             /*
@@ -1238,23 +1841,29 @@ ngx_http_live_init_module(ngx_cycle_t *cycle)
              * It is 32 bytes less than SO_SNDBUF returned by setsockopt().
              */
 
-            buffer_size -= 32;
+            size -= 32;
 #endif
 
-            if (buffer_size < sizeof(ngx_http_live_msg_t)) {
+            if (size < sizeof(ngx_http_live_msg_t)) {
                 ngx_log_error(NGX_LOG_CRIT, cycle->log, 0,
                               "too small live notify buffer");
                 return NGX_ERROR;
             }
 
             ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                          "live notify buffer size:%uz", buffer_size);
+                          "live notify buffer size:%uz", size);
         }
     }
 
-    lmcf->buffer_size = buffer_size;
+    lmcf->bufs.size = (int) (lmcf->bufs.size / 188 + 1) * 188;
+    lmcf->buffer_size = lmcf->bufs.size + offsetof(ngx_http_live_msg_t, data);
+    lmcf->buffer_limit = 3 * lmcf->bufs.num * lmcf->buffer_size;
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                    "live read buffer size:%uz limit:%uz",
+                    lmcf->buffer_size - offsetof(ngx_http_live_msg_t, data),
+                    lmcf->buffer_limit);
 
-    lmcf->buf = ngx_create_temp_buf(cycle->pool, buffer_size);
+    lmcf->buf = ngx_create_temp_buf(cycle->pool, lmcf->buffer_size);
     if (lmcf->buf == NULL) {
         return NGX_ERROR;
     }
@@ -1278,6 +1887,25 @@ ngx_http_live_notify_cleanup(void *data)
     }
 }
 
+static ngx_flag_t
+ngx_http_live_rbtree_empty(ngx_rbtree_t *rbtree)
+{
+    if (rbtree->root == rbtree->sentinel)
+        return 1;
+    return 0;
+}
+
+static void
+ngx_http_live_timer_check_handler(ngx_event_t *ev)
+{
+    ngx_http_live_main_conf_t    *lmcf;
+
+    lmcf = (ngx_http_live_main_conf_t *) ev->data;
+
+    if (!ngx_exiting || !ngx_http_live_rbtree_empty(&lmcf->live->sh->ptree)) {
+        ngx_add_timer(ev, lmcf->check_period);
+    }
+}
 
 static ngx_int_t
 ngx_http_live_init_process(ngx_cycle_t *cycle)
@@ -1289,7 +1917,7 @@ ngx_http_live_init_process(ngx_cycle_t *cycle)
     ngx_connection_t           *c;
     ngx_http_live_main_conf_t  *lmcf;
 
-    if (ngx_process != NGX_PROCESS_WORKER) {
+    if (ngx_process != NGX_PROCESS_WORKER && ngx_process != NGX_PROCESS_SINGLE) {
         return NGX_OK;
     }
 
@@ -1302,6 +1930,7 @@ ngx_http_live_init_process(ngx_cycle_t *cycle)
     fd = NGX_INVALID_FILE;
 
     for (n = 0; n < lmcf->nfd; n++) {
+        // ngx_worker id: 0 - ($num_workers - 1)
         if (n == ngx_worker) {
             fd = lmcf->read_fd[n];
             continue;
@@ -1321,7 +1950,7 @@ ngx_http_live_init_process(ngx_cycle_t *cycle)
     }
 
     event = (ngx_event_flags & NGX_USE_CLEAR_EVENT) ? NGX_CLEAR_EVENT
-                                                    : NGX_LEVEL_EVENT;
+            : NGX_LEVEL_EVENT;
 
     c = ngx_get_connection(fd, cycle->log);
     if (c == NULL) {
@@ -1372,6 +2001,11 @@ ngx_http_live_init_process(ngx_cycle_t *cycle)
     lmcf->read_fd = NULL;
     lmcf->write_fd = NULL;
 
+    lmcf->check_event.handler = ngx_http_live_timer_check_handler;
+    lmcf->check_event.log = ngx_cycle->log;
+    lmcf->check_event.data = lmcf;
+    ngx_add_timer(&lmcf->check_event, lmcf->check_period);
+
     return NGX_OK;
 }
 
@@ -1386,7 +2020,7 @@ ngx_http_live_notify_read_handler(ngx_event_t *rev)
     ngx_http_live_main_conf_t  *lmcf;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                   "http live notify read handler");
+                   "live notify read handler");
 
     c = rev->data;
     lmcf = c->data;
@@ -1408,7 +2042,7 @@ ngx_http_live_notify_read_handler(ngx_event_t *rev)
 
         if ((size_t) n != msg->size) {
             ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "live notify message size error");
+                          "live notify message size error: %z %z", n, msg->size);
             continue;
         }
 
@@ -1419,37 +2053,371 @@ ngx_http_live_notify_read_handler(ngx_event_t *rev)
             ngx_hex_dump(hex, msg->md5, 16);
 
             ngx_log_debug5(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                           "http live notify recv n:%z, c:%ui, l:%d, md5:%*s",
+                           "live notify recv n:%z, c:%ui, l:%d, md5:%*s",
                            n, msg->counter, msg->last, 32, hex);
         }
 #endif
+        b->pos = b->start;
+        b->last = b->start + n;
 
-        ngx_http_live_notify_process_msg(msg);
+        if (lmcf->gop_cache) {
+            ngx_http_live_notify_process_gop(msg, b, lmcf->buffer_limit);
+        } else {
+            ngx_http_live_notify_process_msg(msg);
+        }
     }
 
     (void) ngx_handle_read_event(rev, 0);
 }
 
 
-static void
-ngx_http_live_notify_process_msg(ngx_http_live_msg_t *msg)
+static ngx_uint_t
+ngx_http_live_get_data_handler(ngx_http_request_t *r, ngx_http_live_ctx_t *ctx, u_char *p, ngx_uint_t size)
 {
-    u_char                    *p;
-    size_t                     size;
+    size_t                     n;
+    ngx_buf_t                 *b;
+    ngx_chain_t               *cl, **ll;
+    ngx_http_live_t           *live;
+    ngx_http_live_main_conf_t *lmcf;
+
+    if (ctx->done || size <= 0) {
+        return 0;
+    }
+
+    live = ctx->live;
+
+    lmcf = ngx_http_get_module_main_conf(r, ngx_http_live_module);
+
+    for (ll = &ctx->out; *ll; ll = &(*ll)->next);
+
+    while (size) {
+        if (ctx->free) {
+            cl = ctx->free;
+            ctx->free = cl->next;
+
+        } else if (ctx->allocated < (ngx_uint_t) lmcf->bufs.num) {
+            cl = ngx_alloc_chain_link(r->pool);
+            if (cl == NULL) {
+                return size;
+            }
+
+            cl->buf = ngx_create_temp_buf(r->pool, lmcf->bufs.size);
+            if (cl->buf == NULL) {
+                return size;
+            }
+
+            ctx->allocated++;
+        } else {
+            return size;
+        }
+
+        *ll = cl;
+        ll = &cl->next;
+        cl->next = NULL;
+
+        n = size > lmcf->bufs.size ? lmcf->bufs.size : size;
+
+        b = cl->buf;
+        b->tag = &ngx_http_live_module;
+        b->flush = live->flush;
+        b->pos = b->start;
+        b->last = ngx_cpymem(b->pos, p, n);
+
+        p += n;
+        ctx->size += n;
+        size -= n;
+    }
+    ctx->counter ++;
+
+    return size;
+}
+
+static void
+ngx_http_live_gop_buf_handler(ngx_http_request_t *r, ngx_http_live_gop_node_t *gop)
+{
+    ngx_flag_t                   kpos_flag;
+    u_char                      *p;
+    ngx_uint_t                   len, size;
+    ngx_http_live_ctx_t         *ctx;
+    ngx_http_live_msg_t         *msg;
+
+    kpos_flag = 0;
+    ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
+
+    if (ctx == NULL || ctx->done) {
+        return;
+    }
+
+    if (!gop || !gop->key) {
+        if (!ctx->live->persistent)
+            ctx->done = 1;
+        else
+            ctx->in = NULL;
+        return;
+    }
+
+    if (ctx->counter == 0 && gop->ts_index_tables) {
+        // first write ts index tables(pat/pmt)
+        msg = (ngx_http_live_msg_t *) (gop->ts_index_tables->pos);
+        p = &msg->data[0];
+        len = msg->size - offsetof(ngx_http_live_msg_t, data);
+        size = ngx_http_live_get_data_handler(r, ctx, p, len);
+        if (size) {
+            ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "failed write ts tables:%ui", len);
+        }
+    }
+
+    size = 0;
+    msg = NULL;
+    if (!ctx->in) {
+        kpos_flag = 1;
+        ctx->in = gop->key;
+        ctx->size = 0;
+        msg = (ngx_http_live_msg_t *) (ctx->in->buf->pos);
+        ngx_log_error(NGX_LOG_NOTICE, r->connection->log, 0, "using key buffer %ui/%ui/%ui %ui",
+                        ctx->counter, msg->counter, gop->latest_counter, msg->flag);
+        ctx->counter = msg->counter;
+    }
+
+    while (ctx->in) {
+        if (ctx->in->buf->start == ctx->in->buf->last) {
+            return;
+        }
+        msg = (ngx_http_live_msg_t *) (ctx->in->buf->pos);
+        if (kpos_flag) {
+            ctx->size += msg->kpos;
+            kpos_flag = 0;
+        }
+        p = &msg->data[0] + ctx->size;
+        size = msg->size - offsetof(ngx_http_live_msg_t, data) - ctx->size;
+        size = ngx_http_live_get_data_handler(r, ctx, p, size);
+        if (size || !ctx->in->next) {
+            break;
+        }
+        ctx->in = ctx->in->next;
+        ctx->size = 0;
+    }
+
+    if (msg && msg->expired && size) {
+        ctx->in = NULL;
+        return;
+    }
+
+    return;
+}
+
+static void
+ngx_http_live_gop_node_cleanup(ngx_pool_t *pool, ngx_http_live_gop_node_t *gop)
+{
+    if (gop->pool) {
+        ngx_destroy_pool(gop->pool);
+    }
+    if (pool) {
+        ngx_pfree(pool, gop);
+    }
+}
+
+static ngx_http_live_gop_node_t*
+ngx_http_live_gop_node_alloc(ngx_pool_t *pool, ngx_log_t *log)
+{
+    size_t                          size;
+    ngx_http_live_gop_node_t        *gop;
+
+    size = ngx_max(sizeof(ngx_http_live_gop_node_t), pool->max) + 1;
+    gop = ngx_pcalloc(pool, size);
+    if (!gop) {
+        return NULL;
+    }
+    gop->pool = ngx_create_pool(8192, log);
+    if (!gop->pool) {
+        ngx_pfree(pool, gop);
+        return NULL;
+    }
+
+    gop->pbusy = &gop->busy;
+    gop->pfree = &gop->free;
+
+    return gop;
+}
+
+static void
+ngx_http_live_gop_mark_expired(ngx_http_live_gop_node_t *gop, size_t limit)
+{
+    ngx_uint_t                   size, count;
+    ngx_chain_t                 *cl;
+    ngx_http_live_msg_t         *msg;
+
+    if (gop->size < limit && gop->count < GOP_COUNT_LIMIT) {
+        return;
+    }
+
+    size = gop->size;
+    count = gop->count;
+    cl = gop->busy;
+
+    while (cl) {
+        if (cl == gop->key) {
+            // incase no key flag found in the middle of stream
+            if (size < limit * 2) {
+                break;
+            } else {
+                gop->key = NULL;
+            }
+        }
+        if (count < GOP_COUNT_LIMIT && size < limit / 2) {
+            break;
+        }
+
+        msg = (ngx_http_live_msg_t *) (cl->buf->pos);
+        msg->expired = 1;
+        size -= msg->size;
+        if (msg->flag & PKT_KEY_FLAG) {
+            count --;
+        }
+        cl = cl->next;
+    }
+
+}
+
+static void
+ngx_http_live_gop_free_expired(ngx_http_live_gop_node_t *gop)
+{
+    ngx_chain_t                 *cl, **busy, **free;
+    ngx_http_live_msg_t         *msg;
+
+    busy = &gop->busy;
+    free = gop->pfree;
+
+    while (*busy) {
+        cl = *busy;
+        msg = (ngx_http_live_msg_t *) (cl->buf->pos);
+        if (!msg->expired) {
+            break;
+        }
+        gop->size -= msg->size;
+        *busy = cl->next;
+        cl->next = NULL;
+        *free = cl;
+        free = &cl->next;
+        cl->buf->last = cl->buf->start;
+        if (msg->flag & PKT_KEY_FLAG) {
+            gop->count --;
+        }
+    }
+    gop->pfree = free;
+}
+
+static ngx_int_t
+ngx_http_live_gop_append_buf(ngx_http_live_gop_node_t *gop, ngx_http_live_msg_t *msg, ngx_buf_t *b, void *tag)
+{
+    ngx_buf_t          *buf;
+    ngx_uint_t          size, n;
+    ngx_chain_t        *cl, **key, **busy, **free;
+
+    key = &gop->key;
+    busy = gop->pbusy;
+    free = &gop->free;
+    size = b->last - b->pos;
+
+    if (msg->flag == PKT_TS_INDEX) {
+        gop->ts_index_tables = ngx_create_temp_buf(gop->pool, b->end - b->start);
+        if (gop->ts_index_tables == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memmove(gop->ts_index_tables->last, b->pos, size);
+        gop->ts_index_tables->last += size;
+        return NGX_OK;
+    }
+
+    if (msg->flag & PKT_KEY_FLAG || gop->size == 0
+            || (msg->flag == PKT_NO_VIDEO && msg->counter % 20 == 0)) {
+        *key = NULL;
+    }
+
+    cl = *busy;
+    gop->size += size;
+    gop->latest_counter = msg->counter;
+
+    while (size) {
+        if (!cl) {
+            if (*free) {
+                *busy = cl = *free;
+                *free = NULL;
+                gop->pfree = free;
+
+                buf = cl->buf;
+            } else {
+                cl = ngx_alloc_chain_link(gop->pool);
+                if (cl == NULL) {
+                    return NGX_ERROR;
+                }
+                *busy = cl;
+                cl->next = NULL;
+                buf = ngx_create_temp_buf(gop->pool, b->end - b->start);
+                if (buf == NULL) {
+                    return NGX_ERROR;
+                }
+                buf->tag = tag;
+                cl->buf = buf;
+            }
+        } else {
+            buf = cl->buf;
+        }
+        if (!(*key)) {
+            *key = cl;
+            gop->count ++;
+            if (!(msg->flag & PKT_KEY_FLAG))
+                msg->flag = PKT_KEY_TEMP; // just marked key; may not a video keyframe
+        }
+        n = buf->end - buf->last;
+        if (n >= size) {
+            n = size;
+            ngx_memmove(buf->last, b->pos, n);
+            buf->last += n;
+            size -= n;
+        }
+        busy = &cl->next;
+        cl = cl->next;
+    }
+    gop->pbusy = busy;
+
+    return NGX_OK;
+}
+
+static void
+ngx_http_live_notify_process_gop(ngx_http_live_msg_t *msg, ngx_buf_t *b, size_t limit)
+{
     ngx_connection_t          *c;
     ngx_http_request_t        *r;
     ngx_http_live_get_node_t  *get;
+    ngx_http_live_gop_node_t  *gop;
 
-    p = &msg->data[0];
-    size = msg->size - offsetof(ngx_http_live_msg_t, data);
+    get = ngx_http_live_get_rbtree_lookup(&msg->live->gtree, msg->md5);
+    gop = ngx_http_live_gop_rbtree_lookup(&msg->live->btree, msg->md5);
 
-    get = ngx_http_live_get_rbtree_lookup(&msg->live->rbtree, msg->md5);
+    if (msg->last && gop) {
+        ngx_rbtree_delete(&msg->live->btree, &gop->node);
+        ngx_http_live_gop_node_cleanup(ngx_cycle->pool, gop);
+        gop = NULL;
+
+    } else if (!msg->last && !gop) {
+        gop = ngx_http_live_gop_node_alloc(ngx_cycle->pool, ngx_cycle->log);
+        if (gop) {
+            ngx_memcpy(gop->md5, msg->md5, 16);
+            ngx_rbtree_insert(&msg->live->btree, &gop->node);
+        }
+    }
+    if (gop) {
+        ngx_http_live_gop_free_expired(gop);
+        ngx_http_live_gop_mark_expired(gop, limit);
+        ngx_http_live_gop_append_buf(gop, msg, b, &ngx_http_live_module);
+    }
 
     while (get) {
         r = get->request;
         c = r->connection;
 
-        ngx_http_live_get_data_handler(r, p, size, msg->counter, msg->last);
+        ngx_http_live_gop_buf_handler(r, gop);
 
         ngx_post_event(c->write, &ngx_posted_events);
 
@@ -1458,7 +2426,7 @@ ngx_http_live_notify_process_msg(ngx_http_live_msg_t *msg)
         }
 
         get = (ngx_http_live_get_node_t *)
-                  ngx_rbtree_next(&msg->live->rbtree, &get->node);
+              ngx_rbtree_next(&msg->live->gtree, &get->node);
 
         if (get && ngx_memcmp(get->md5, msg->md5, 16) != 0) {
             break;
@@ -1466,6 +2434,49 @@ ngx_http_live_notify_process_msg(ngx_http_live_msg_t *msg)
     }
 }
 
+
+static void
+ngx_http_live_notify_process_msg(ngx_http_live_msg_t *msg)
+{
+    u_char                    *p;
+    ngx_uint_t                 size;
+    ngx_connection_t          *c;
+    ngx_http_request_t        *r;
+    ngx_http_live_ctx_t       *ctx;
+    ngx_http_live_get_node_t  *get;
+
+    p = &msg->data[0];
+    size = msg->size - offsetof(ngx_http_live_msg_t, data);
+
+    get = ngx_http_live_get_rbtree_lookup(&msg->live->gtree, msg->md5);
+
+    while (get) {
+        r = get->request;
+        c = r->connection;
+
+        ctx = ngx_http_get_module_ctx(r, ngx_http_live_module);
+
+        if (ctx != NULL && !ctx->done) {
+            if (msg->last && !ctx->live->persistent) {
+                ctx->done = 1;
+            }
+            ngx_http_live_get_data_handler(r, ctx, p, size);
+        }
+
+        ngx_post_event(c->write, &ngx_posted_events);
+
+        if (r != c->data) {
+            ngx_http_post_request(r, NULL);
+        }
+
+        get = (ngx_http_live_get_node_t *)
+              ngx_rbtree_next(&msg->live->gtree, &get->node);
+
+        if (get && ngx_memcmp(get->md5, msg->md5, 16) != 0) {
+            break;
+        }
+    }
+}
 
 static void
 ngx_http_live_notify_write_handler(ngx_event_t *wev)
@@ -1477,7 +2488,7 @@ ngx_http_live_notify_write_handler(ngx_event_t *wev)
     ngx_http_request_t  *r;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                   "http live notify write handler");
+                   "live notify write handler");
 
     c = wev->data;
 
@@ -1508,16 +2519,18 @@ ngx_http_live_notify_write_handler(ngx_event_t *wev)
              */
 
             wev->cancelable = 1;
-            wev->error = 0;
+            wev->error = 1;
 
-            ngx_add_timer(wev, 10);
+            // ngx_add_timer(wev, 10);
 
-            break;
+            // break;
+
+            if (!ngx_exiting && !ngx_terminate) {
+                ngx_log_error(NGX_LOG_EMERG, ngx_cycle->log, 0,
+                            "live notify write error b:%p, n:%z, s:%z",
+                            b, n, b->last - b->pos);
+            }
         }
-
-        ngx_log_debug3(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                       "http live notify send b:%p, n:%z, r:%O",
-                       b, n, b->file_pos);
 
         c->data = cl->next;
 
@@ -1528,8 +2541,6 @@ ngx_http_live_notify_write_handler(ngx_event_t *wev)
         }
 
         if (b->tag == NULL) {
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                           "http live notify free buffer b:%p", b);
             ngx_free(b);
             continue;
         }
@@ -1537,9 +2548,13 @@ ngx_http_live_notify_write_handler(ngx_event_t *wev)
         r = (ngx_http_request_t *) b->tag;
 
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "http live notify reclaim buffer b:%p", b);
+                       "live notify reclaim buffer b:%p", b);
 
-        ngx_post_event(r->connection->read, &ngx_posted_events);
+        if (ngx_exiting || ngx_terminate) {
+            ngx_add_timer(r->connection->read, 1);
+        } else {
+            ngx_post_event(r->connection->read, &ngx_posted_events);
+        }
 
         if (r != r->connection->data) {
             ngx_http_post_request(r, NULL);
@@ -1566,15 +2581,18 @@ ngx_http_live_notify(ngx_http_request_t *r, ngx_buf_t *b)
         msg = (ngx_http_live_msg_t *) b->pos;
         ngx_hex_dump(hex, msg->md5, 16);
 
-        ngx_log_debug7(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                      "http live notify b:%p, n:%z, c:%ui, l:%d, t:%p, md5:%*s",
-                      b, msg->size, msg->counter, msg->last, b->tag, 32, hex);
+        ngx_log_error(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
+                      "live notify b:%p, n:%z, c:%ui, l:%d, f:%ui t:%p, md5:%*s",
+                      b, msg->size, msg->counter, msg->last, msg->flag, b->tag, 32, hex);
     }
 #endif
 
     lmcf = ngx_http_get_module_main_conf(r, ngx_http_live_module);
 
     for (n = 0; n < lmcf->nfd; n++) {
+        if (n == ngx_worker) {
+            continue;
+        }
         cl = ngx_alloc_chain_link(ngx_cycle->pool);
         if (cl == NULL) {
             return NGX_ERROR;
@@ -1585,19 +2603,19 @@ ngx_http_live_notify(ngx_http_request_t *r, ngx_buf_t *b)
         cl->buf = b;
         cl->next = NULL;
 
-        c = lmcf->conn[n];
+        if (lmcf->conn) {
+            c = lmcf->conn[n];
 
-        for (ll = (ngx_chain_t **) &c->data; *ll; ll = &(*ll)->next);
-        *ll = cl;
+            for (ll = (ngx_chain_t **) &c->data; *ll; ll = &(*ll)->next);
+            *ll = cl;
 
-        if (c->data == cl && c->write->ready) {
-            ngx_post_event(c->write, &ngx_posted_events);
+            if (c->data == cl && c->write->ready) {
+                ngx_post_event(c->write, &ngx_posted_events);
+            }
         }
     }
 
     if (b->file_pos == 0 && b->tag == NULL) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ngx_cycle->log, 0,
-                       "http live notify free buffer b:%p", b);
         ngx_free(b);
     }
 
